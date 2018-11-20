@@ -41,8 +41,8 @@ func New(name string, opt Options) (*LimitCtl, error) {
 	}
 
 	ctl.init()
-	go ctl.bgSyncLimitData()
-	go ctl.bgPurgeReset()
+	go ctl.bgSyncLimitHandle()
+	go ctl.bgPurgeResetHandle()
 
 	return ctl, nil
 }
@@ -126,7 +126,7 @@ func (ctl *LimitCtl) Stop() {
 }
 
 // sync redis counter
-func (ctl *LimitCtl) bgSyncLimitData() {
+func (ctl *LimitCtl) bgSyncLimitHandle() {
 	for ctl.running {
 		time.Sleep(ctl.options.SyncInterval)
 
@@ -166,7 +166,7 @@ func (ctl *LimitCtl) bgSyncLimitData() {
 }
 
 // reset before counter
-func (ctl *LimitCtl) bgPurgeReset() {
+func (ctl *LimitCtl) bgPurgeResetHandle() {
 	for ctl.running {
 		time.Sleep(time.Duration(ctl.options.Period) * time.Second)
 
@@ -240,7 +240,7 @@ func (ctl *LimitCtl) IncrbyBlock(tag string) error {
 		if err != nil && err == ErrBeyondMaxLimitValCheck {
 			continue
 		}
-
+		// just wakeup call by bgSyncLimitData, still try again
 		reportor.Wait()
 	}
 }
