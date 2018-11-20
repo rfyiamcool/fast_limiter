@@ -56,7 +56,7 @@ type LimitCtl struct {
 
 	options Options
 
-	// map slice
+	// protect each pool
 	lock sync.Mutex
 
 	// counter
@@ -123,6 +123,9 @@ func (ctl *LimitCtl) makeWaitQueuePool() map[string]*waitQueue {
 // stop bg goroutine
 func (ctl *LimitCtl) Stop() {
 	ctl.running = false
+	for _, w := range ctl.waitQueuePool {
+		w.WakeupAll()
+	}
 }
 
 // sync redis counter
