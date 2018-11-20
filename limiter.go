@@ -181,7 +181,6 @@ func (ctl *LimitCtl) bgPurgeResetHandle() {
 
 // add tag, copy on write
 func (ctl *LimitCtl) AddTag(name string, value int64) {
-
 	ctl.lock.Lock()
 	defer ctl.lock.Unlock()
 
