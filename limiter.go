@@ -130,9 +130,8 @@ func (ctl *LimitCtl) Stop() {
 
 // sync redis counter
 func (ctl *LimitCtl) bgSyncLimitHandle() {
+	time.Sleep(ctl.options.MaxSyncInterval)
 	for ctl.running {
-		time.Sleep(ctl.options.SyncInterval)
-
 		redisClient := ctl.redisClient.Get()
 
 		// get current shard
@@ -143,12 +142,13 @@ func (ctl *LimitCtl) bgSyncLimitHandle() {
 		// transaction + pipeline
 		redisClient.Send("MULTI")
 		for tag, model := range shard {
-			redisClient.Send("HINCRBY", ctl.makeRedisKey(), tag, model.localCounter-model.lastCounter)
-			model.lastCounter = model.localCounter
-			tagList = append(tagList, tag)
-
-			// wake all waiter
+			// if first, wake all waiter
 			ctl.tryWakeupWorkers(tag, model)
+
+			diff := model.LocalCounter - model.LastCounter
+			redisClient.Send("HINCRBY", ctl.makeRedisKey(), tag, diff)
+			model.LastCounter = model.LocalCounter
+			tagList = append(tagList, tag)
 		}
 		redisClient.Send("expire", ctl.makeRedisKey(), ctl.redisKeyTTL)
 		resp, err := redis.Int64s(redisClient.Do("EXEC"))
@@ -157,14 +157,26 @@ func (ctl *LimitCtl) bgSyncLimitHandle() {
 			logger("sync redis limit data failed, err: %s" + err.Error())
 			continue
 		}
+		redisClient.Close()
 
+		noUpdateIncr := 0
 		// update memory counter
 		for idx, tag := range tagList {
 			val := resp[idx]
-			shard[tag].globalCounter = val
+			// no updates
+			if shard[tag].GlobalCounter == val {
+				noUpdateIncr++
+				continue
+			}
+
+			shard[tag].GlobalCounter = val
 		}
 
-		redisClient.Close()
+		if noUpdateIncr == len(tagList) {
+			time.Sleep(ctl.options.MaxSyncInterval)
+		} else {
+			time.Sleep(ctl.options.MinSyncInterval)
+		}
 	}
 }
 
@@ -222,8 +234,8 @@ func (ctl *LimitCtl) DeleleTag() {
 }
 
 // set sync interval
-func (ctl *LimitCtl) SetSyncInterval(d time.Duration) {
-	ctl.options.SyncInterval = d
+func (ctl *LimitCtl) SetMaxSyncInterval(d time.Duration) {
+	ctl.options.MaxSyncInterval = d
 }
 
 // block
@@ -231,11 +243,12 @@ func (ctl *LimitCtl) IncrbyBlock(tag string) error {
 	for {
 		reportor, err := ctl.incrby(tag, true)
 
+		// allow incrby
 		if reportor == nil && err == nil {
 			return nil
 		}
 
-		// already full, direct return
+		// waitQueue is already full, direct return
 		if err != nil && (err == ErrBeyondMaxWaiter || err == ErrWaitQueueFull) {
 			return err
 		}
@@ -335,11 +348,11 @@ func (ctl *LimitCtl) addWaiter(tag string, model *LimitModel) (*waitEntry, error
 
 // wakeup in new time windows
 func (ctl *LimitCtl) tryWakeupWorkers(tag string, model *LimitModel) {
-	if model.first != 0 {
+	if model.First != 0 {
 		return
 	}
 
-	ok := atomic.CompareAndSwapInt64(&model.first, firstUndo, firstDone)
+	ok := atomic.CompareAndSwapInt64(&model.First, firstUndo, firstDone)
 	if !ok {
 		return
 	}
@@ -383,37 +396,37 @@ func (ctl *LimitCtl) getTimeShardsInPool(ts int) map[string]*LimitModel {
 }
 
 type LimitModel struct {
-	first         int64 // 0 = none, 1 = used
-	localCounter  int64 // local counter
-	globalCounter int64 // sync redis counter to globalCounter
-	lastCounter   int64 // counter sync to redis last time
+	First         int64 // 0 = none, 1 = used
+	LocalCounter  int64 // local counter
+	GlobalCounter int64 // sync redis counter to globalCounter
+	LastCounter   int64 // counter sync to redis last time
 }
 
 func (l *LimitModel) reset() {
-	l.first = 0
-	l.globalCounter = 0
-	l.localCounter = 0
-	l.lastCounter = 0
+	l.First = 0
+	l.GlobalCounter = 0
+	l.LocalCounter = 0
+	l.LastCounter = 0
 }
 
 func (l *LimitModel) getLocalCounter() int64 {
-	return atomic.LoadInt64(&l.localCounter)
+	return atomic.LoadInt64(&l.LocalCounter)
 }
 
 func (l *LimitModel) getGlobalCounter() int64 {
-	return atomic.LoadInt64(&l.globalCounter)
+	return atomic.LoadInt64(&l.GlobalCounter)
 }
 
 func (l *LimitModel) addLocalCounter() int64 {
-	return atomic.AddInt64(&l.localCounter, 1)
+	return atomic.AddInt64(&l.LocalCounter, 1)
 }
 
 func (l *LimitModel) reduceLocalCounter() int64 {
-	return atomic.AddInt64(&l.localCounter, -1)
+	return atomic.AddInt64(&l.LocalCounter, -1)
 }
 
 func (l *LimitModel) addGlobalCounter() int64 {
-	return atomic.AddInt64(&l.globalCounter, 1)
+	return atomic.AddInt64(&l.GlobalCounter, 1)
 }
 
 func NewOptions() Options {
@@ -434,10 +447,13 @@ type Options struct {
 	// limit max value per period seconds
 	Period int // time unit: second, default 1s
 
-	MaxlimitModelPool int // default 60
+	// default 60
+	MaxlimitModelPool int
 
 	// sync redis limit data in per
-	SyncInterval time.Duration
+	MaxSyncInterval time.Duration
+	// Dynamic change delay
+	MinSyncInterval time.Duration
 }
 
 func (opt *Options) init() {
@@ -449,8 +465,17 @@ func (opt *Options) init() {
 		opt.Period = 1 // seconds
 	}
 
-	if opt.SyncInterval.Seconds() == 0 {
-		opt.SyncInterval = 200 * time.Millisecond
+	if opt.MaxSyncInterval.Seconds() == 0 {
+		opt.MaxSyncInterval = 200 * time.Millisecond
+		opt.MinSyncInterval = opt.MaxSyncInterval / 2
+	}
+
+	if opt.MaxSyncInterval.Seconds() > 1 {
+		opt.MinSyncInterval = opt.MaxSyncInterval / 5
+	}
+
+	if opt.MinSyncInterval.Seconds() > opt.MaxSyncInterval.Seconds() {
+		panic("must MaxSyncInterval > MinSyncInterval")
 	}
 
 	if opt.MaxWaiter == 0 {
