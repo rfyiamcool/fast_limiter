@@ -273,6 +273,9 @@ func (ctl *LimitCtl) incrby(tag string, block bool) (*waitEntry, error) {
 		return nil, ErrTagNotFoundPool
 	}
 
+	// if first; try wakeup
+	ctl.tryWakeupWorkers(tag, model)
+
 	maxValue, _ := ctl.options.TagRules[tag]
 	if model.getLocalCounter() < maxValue && model.getGlobalCounter() < maxValue {
 		resp := model.addLocalCounter()
